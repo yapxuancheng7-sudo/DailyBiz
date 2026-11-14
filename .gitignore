@@ -1,0 +1,13 @@
+# Private data
+instance/
+
+# Python environment
+.venv/
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Secret environment variables
+.env
