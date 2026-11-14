@@ -114,6 +114,110 @@ def init_db():
 
 init_db()
 
+@app.route("/admin-recovery", methods=["GET", "POST"])
+def admin_recovery():
+
+    recovery_key = os.environ.get("ADMIN_RECOVERY_KEY", "")
+
+    if not recovery_key:
+        abort(404)
+
+    if request.method == "GET":
+        return render_template_string("""
+            <h2>DailyBiz Admin Recovery</h2>
+            <form method="POST">
+                <input type="hidden" name="csrf_token"
+                    value="{{ csrf }}">
+                <p>Recovery Key</p>
+                <input type="password" name="recovery_key" required>
+
+                <p>New Admin Username</p>
+                <input type="text" name="username" required>
+
+                <p>New Admin Password</p>
+                <input type="password" name="password" required>
+
+                <button type="submit">Recover Admin</button>
+            </form>
+        """, csrf=session.get("csrf_token"))
+
+    supplied_key = request.form.get("recovery_key", "")
+
+    if not hmac.compare_digest(supplied_key, recovery_key):
+        abort(403)
+
+    username = request.form.get("username", "").strip()
+    password = request.form.get("password", "")
+
+    if (
+        not re.fullmatch(r"[a-zA-Z0-9_.-]{3,40}", username)
+        or len(password) < 12
+        or len(password) > 128
+    ):
+        return "Invalid username or password. Password must be 12-128 characters.", 400
+
+    db = connect_db()
+
+    try:
+        existing = db.execute(
+            "SELECT id FROM users WHERE username = ?",
+            (username,)
+        ).fetchone()
+
+        if existing:
+            if existing["id"] not in [
+                row["id"] for row in db.execute(
+                    "SELECT id FROM users WHERE role = 'admin'"
+                ).fetchall()
+            ]:
+                return "Username already belongs to another account.", 409
+
+        admin = db.execute(
+            "SELECT id FROM users WHERE role = 'admin' ORDER BY id LIMIT 1"
+        ).fetchone()
+
+        password_hash = generate_password_hash(password)
+
+        if admin:
+            db.execute("""
+                UPDATE users
+                SET username = ?, password_hash = ?, active = 1
+                WHERE id = ?
+            """, (username, password_hash, admin["id"]))
+
+            db.execute("""
+                UPDATE users
+                SET active = 0
+                WHERE role = 'admin' AND id != ?
+            """, (admin["id"],))
+
+        else:
+            db.execute("""
+                INSERT INTO users
+                (username, password_hash, business_name,
+                 role, active, created_at)
+                VALUES (?, ?, 'DailyBiz Administration',
+                        'admin', 1, ?)
+            """, (
+                username,
+                password_hash,
+                datetime.now().strftime("%Y-%m-%d %H:%M")
+            ))
+
+        db.commit()
+
+        return """
+            <h2>Admin recovery successful!</h2>
+            <p>Your new Admin account is ready.</p>
+            <a href="/">Go to Login</a>
+        """
+
+    except sqlite3.IntegrityError:
+        db.rollback()
+        return "Username already exists.", 409
+
+    finally:
+        db.close()
 
 # ==========================================
 # 3. SECURITY AND HELPERS
