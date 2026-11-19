@@ -2,7 +2,9 @@ import os
 import sys
 import re
 import hmac
+import time
 import uuid
+import getpass
 import sqlite3
 import secrets
 import imagehash
@@ -11,7 +13,6 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from datetime import date, datetime, timedelta
 from functools import wraps
-
 from flask import (
     Flask, request, redirect, url_for, session,
     flash, render_template_string, send_from_directory,
@@ -38,7 +39,7 @@ DATABASE = INSTANCE_DIR / "dailybiz.db"
 SECRET_FILE = INSTANCE_DIR / "secret_key"
 
 if SECRET_FILE.exists():
-    SECRET_KEY = SECRET_FILE.read_text()
+    SECRET_KEY = SECRET_FILE.read_text().strip()
 else:
     SECRET_KEY = secrets.token_hex(32)
     SECRET_FILE.write_text(SECRET_KEY)
@@ -46,7 +47,15 @@ else:
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
 app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+# Set COOKIE_SECURE=1 when the site runs on HTTPS.
+app.config["SESSION_COOKIE_SECURE"] = os.environ.get("COOKIE_SECURE") == "1"
+
 ALLOWED_EXTENSIONS = {"jpg", "jpeg", "png", "webp"}
+
+USERNAME_RE = re.compile(r"[a-zA-Z0-9_.-]{3,40}")
+ADMIN_BUSINESS_NAME = "DailyBiz Administration"
 
 
 # ==========================================
@@ -91,10 +100,7 @@ def init_db():
         )
     """)
 
-    columns = db.execute(
-        "PRAGMA table_info(transactions)"
-    ).fetchall()
-
+    columns = db.execute("PRAGMA table_info(transactions)").fetchall()
     column_names = [column[1] for column in columns]
 
     if "receipt_hash" not in column_names:
@@ -113,6 +119,108 @@ def init_db():
 
 
 init_db()
+
+
+# ==========================================
+# 2B. ADMIN ACCOUNT (single place for all admin creation)
+# ==========================================
+# Used by:
+#   1. ensure_admin()      -> environment variables at startup
+#   2. /admin-recovery     -> web page protected by ADMIN_RECOVERY_KEY
+#   3. create_admin()      -> command line: python app.py create-admin
+
+def validate_admin_credentials(username, password):
+    """Return an error message, or None if everything is valid."""
+    if not USERNAME_RE.fullmatch(username):
+        return ("Invalid username. Use 3-40 letters, numbers, "
+                "dots, underscores or hyphens.")
+
+    if len(password) < 12 or len(password) > 128:
+        return "Password must be between 12 and 128 characters."
+
+    return None
+
+
+def upsert_admin(username, password, reset_existing=True):
+    """
+    Create an admin, or reset the password of an existing admin.
+    Returns (ok, message).
+    Never touches a customer (owner) account with the same username.
+    """
+    username = username.strip()
+
+    error = validate_admin_credentials(username, password)
+    if error:
+        return False, error
+
+    db = connect_db()
+
+    try:
+        existing = db.execute(
+            "SELECT id, role FROM users WHERE username = ?",
+            (username,)
+        ).fetchone()
+
+        if existing:
+            if existing["role"] != "admin":
+                return False, "This username belongs to a customer account."
+
+            if not reset_existing:
+                return True, "Admin account already exists."
+
+            db.execute("""
+                UPDATE users
+                SET password_hash = ?, active = 1
+                WHERE id = ?
+            """, (generate_password_hash(password), existing["id"]))
+
+            db.commit()
+            return True, "Admin account recovered successfully!"
+
+        db.execute("""
+            INSERT INTO users
+            (username, password_hash, business_name,
+             role, active, created_at)
+            VALUES (?, ?, ?, 'admin', 1, ?)
+        """, (
+            username,
+            generate_password_hash(password),
+            ADMIN_BUSINESS_NAME,
+            datetime.now().strftime("%Y-%m-%d %H:%M")
+        ))
+
+        db.commit()
+        return True, "Admin account created successfully!"
+
+    except sqlite3.IntegrityError:
+        db.rollback()
+        return False, "Could not create admin account."
+
+    finally:
+        db.close()
+
+
+def ensure_admin():
+    """
+    Startup: create the admin from ADMIN_USERNAME / ADMIN_PASSWORD.
+    If the admin already exists its password is NOT changed, unless
+    ADMIN_FORCE_RESET=1 is set.
+    """
+    username = os.environ.get("ADMIN_USERNAME")
+    password = os.environ.get("ADMIN_PASSWORD")
+
+    if not username or not password:
+        print("[admin] ADMIN_USERNAME / ADMIN_PASSWORD not set, skipping.")
+        return
+
+    force = os.environ.get("ADMIN_FORCE_RESET") == "1"
+    ok, message = upsert_admin(username, password, reset_existing=force)
+
+    print(("[admin] " if ok else "[admin ERROR] ") + message)
+
+
+ensure_admin()
+
 
 # ==========================================
 # 3. SECURITY AND HELPERS
@@ -189,8 +297,120 @@ def admin_required(func):
     return wrapper
 
 
+@app.route("/admin-recovery", methods=["GET", "POST"])
+def admin_recovery():
+
+    recovery_key = os.environ.get("ADMIN_RECOVERY_KEY")
+
+    if not recovery_key:
+        return "Admin recovery is not configured.", 503
+
+    message = ""
+
+    if request.method == "POST":
+
+        submitted_key = request.form.get("recovery_key", "")
+
+        if not hmac.compare_digest(submitted_key, recovery_key):
+            time.sleep(1)  # slow down guessing
+            message = "Invalid recovery key."
+
+        else:
+            username = request.form.get("username", "").strip()
+            password = request.form.get("password", "")
+
+            ok, message = upsert_admin(username, password)
+
+    return render_template_string("""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>DailyBiz Admin Recovery</title>
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <style>
+                body {
+                    font-family: Arial, sans-serif;
+                    background: #f4f6f9;
+                    display: flex;
+                    justify-content: center;
+                    align-items: center;
+                    min-height: 100vh;
+                    margin: 0;
+                }
+                .box {
+                    background: white;
+                    padding: 30px;
+                    border-radius: 12px;
+                    width: 90%;
+                    max-width: 380px;
+                    box-shadow: 0 4px 20px #0001;
+                }
+                input, button {
+                    box-sizing: border-box;
+                    width: 100%;
+                    padding: 12px;
+                    margin-top: 12px;
+                    border-radius: 7px;
+                    border: 1px solid #ddd;
+                }
+                button {
+                    background: #2563eb;
+                    color: white;
+                    border: none;
+                    cursor: pointer;
+                }
+                .message {
+                    margin-top: 15px;
+                    color: #2563eb;
+                }
+            </style>
+        </head>
+        <body>
+            <div class="box">
+                <h2>Admin Recovery</h2>
+
+                <form method="POST">
+                    <input type="hidden" name="csrf_token" value="{{ csrf }}">
+
+                    <input
+                        type="password"
+                        name="recovery_key"
+                        placeholder="Recovery Key"
+                        required
+                    >
+
+                    <input
+                        type="text"
+                        name="username"
+                        placeholder="Admin Username"
+                        minlength="3"
+                        maxlength="40"
+                        required
+                    >
+
+                    <input
+                        type="password"
+                        name="password"
+                        placeholder="New Admin Password"
+                        minlength="12"
+                        maxlength="128"
+                        required
+                    >
+
+                    <button type="submit">Recover Admin Account</button>
+                </form>
+
+                {% if message %}
+                    <p class="message">{{ message }}</p>
+                {% endif %}
+            </div>
+        </body>
+        </html>
+    """, message=message, csrf=session.get("csrf_token", ""))
+
+
 def money(cents):
-    return f"RM {cents / 100:,.2f}"
+    return f"$ {cents / 100:,.2f}"
 
 
 def parse_amount(value):
@@ -234,7 +454,7 @@ def upload_receipt(file):
 
     original_name = secure_filename(file.filename)
 
-    if not original_name:
+    if not original_name or "." not in original_name:
         raise ValueError("Invalid file name.")
 
     extension = original_name.rsplit(".", 1)[1].lower()
@@ -244,6 +464,7 @@ def upload_receipt(file):
 
     return new_name
 
+
 def get_receipt_hash(filepath):
     try:
         with Image.open(filepath) as img:
@@ -251,16 +472,18 @@ def get_receipt_hash(filepath):
             return str(imagehash.phash(img))
     except Exception:
         return ""
-    
+
+
 def compare_receipt_hash(hash1, hash2):
-        try:
-            image1 = imagehash.hex_to_hash(str(hash1))
-            image2 = imagehash.hex_to_hash(str(hash2))
+    try:
+        image1 = imagehash.hex_to_hash(str(hash1))
+        image2 = imagehash.hex_to_hash(str(hash2))
 
-            return image1 - image2
+        return image1 - image2
 
-        except (ValueError, TypeError):
-            return 999
+    except (ValueError, TypeError):
+        return 999
+
 
 def delete_receipt(filename):
     if filename:
@@ -580,6 +803,8 @@ footer {
         <a href="{{ url_for('home') }}">Home</a>
         {% if user['role'] == 'admin' %}
         <a href="{{ url_for('admin') }}">Accounts</a>
+        {% else %}
+        <a href="{{ url_for('analytics') }}">Analytics</a>
         {% endif %}
         <a href="{{ url_for('logout') }}">Logout</a>
     </div>
@@ -698,9 +923,15 @@ footer {
         <a class="btn" href="{{ url_for('add_transaction',kind='income') }}">
             + Record Revenue
         </a>
+
         <a class="btn btn-danger" href="{{ url_for('add_transaction',kind='expense') }}">
             + Record Expense
         </a>
+
+        <a class="btn btn-secondary" href="{{ url_for('analytics') }}">
+            📊 Analytics
+        </a>
+
         <a class="btn btn-secondary" href="{{ url_for('history') }}">
             View History
         </a>
@@ -737,6 +968,75 @@ footer {
     {% endif %}
 </div>
 
+{% elif page == 'analytics' %}
+
+<div class="heading">
+    <div>
+        <h1>Business Analytics</h1>
+        <p class="sub">Revenue and expenses for a date range.</p>
+    </div>
+    <a class="btn btn-secondary" href="{{ url_for('home') }}">Dashboard</a>
+</div>
+
+<div class="panel">
+    <form method="GET" action="{{ url_for('analytics') }}"
+          class="filters" style="grid-template-columns:1fr 1fr auto;">
+        <div>
+            <label>Start Date</label>
+            <input type="date" name="start" value="{{ start_date }}">
+        </div>
+
+        <div>
+            <label>End Date</label>
+            <input type="date" name="end" value="{{ end_date }}">
+        </div>
+
+        <button class="btn" type="submit">Apply</button>
+    </form>
+</div>
+
+<div class="grid">
+    <div class="card">
+        <small>Total Revenue</small>
+        <h2 class="green">{{ money(total_income) }}</h2>
+    </div>
+
+    <div class="card">
+        <small>Total Expenses</small>
+        <h2 class="red">{{ money(total_expense) }}</h2>
+    </div>
+
+    <div class="card">
+        <small>Net Profit</small>
+        <h2>{{ money(total_income - total_expense) }}</h2>
+    </div>
+</div>
+
+<div class="panel">
+    <h2>Daily Performance</h2>
+
+    {% if daily_records %}
+    <table>
+        <tr>
+            <th>Date</th>
+            <th>Revenue</th>
+            <th>Expenses</th>
+            <th>Profit</th>
+        </tr>
+
+        {% for day in daily_records %}
+        <tr>
+            <td>{{ day.date }}</td>
+            <td class="type-income">{{ money(day.income) }}</td>
+            <td class="type-expense">{{ money(day.expense) }}</td>
+            <td>{{ money(day.income - day.expense) }}</td>
+        </tr>
+        {% endfor %}
+    </table>
+    {% else %}
+    <div class="empty">No transactions found for this period.</div>
+    {% endif %}
+</div>
 
 {% elif page == 'transaction' %}
 
@@ -774,7 +1074,7 @@ footer {
         </div>
 
         <div>
-            <label>Amount (RM)</label>
+            <label>Amount ($)</label>
             <input type="number" name="amount" min="0.01"
                    step="0.01" required value="{{ amount }}">
         </div>
@@ -875,11 +1175,7 @@ footer {
         enctype="multipart/form-data"
     >
 
-        <input
-            type="hidden"
-            name="csrf_token"
-            value="{{ csrf }}"
-        >
+        <input type="hidden" name="csrf_token" value="{{ csrf }}">
 
         <input
             type="file"
@@ -1004,12 +1300,14 @@ footer {
 <div class="panel">
     <h2>Existing Accounts</h2>
 
+    {% if accounts %}
     <table>
         <tr>
             <th>Business</th>
             <th>Username</th>
             <th>Status</th>
             <th>Created</th>
+            <th>Action</th>
         </tr>
 
         {% for u in accounts %}
@@ -1018,15 +1316,36 @@ footer {
             <td>{{ u['username'] }}</td>
             <td>
                 {% if u['active'] %}
-                <span class="type-income">Active</span>
+                    <span class="type-income">Active</span>
                 {% else %}
-                <span class="type-expense">Disabled</span>
+                    <span class="type-expense">Disabled</span>
                 {% endif %}
             </td>
             <td>{{ u['created_at'] }}</td>
+            <td>
+                {% if u['active'] %}
+                    <form method="POST"
+                        action="{{ url_for('deactivate_user', user_id=u['id']) }}"
+                        onsubmit="return confirm('Are you sure you want to deactivate this customer?');">
+                        <input type="hidden" name="csrf_token" value="{{ csrf }}">
+                        <button class="btn btn-danger" type="submit">Deactivate</button>
+                    </form>
+                {% else %}
+                    <form method="POST"
+                        action="{{ url_for('reactivate_user', user_id=u['id']) }}"
+                        onsubmit="return confirm('Are you sure you want to reactivate this customer?');">
+                        <input type="hidden" name="csrf_token" value="{{ csrf }}">
+                        <button class="btn btn-secondary" type="submit">Reactivate</button>
+                    </form>
+                {% endif %}
+            </td>
         </tr>
         {% endfor %}
     </table>
+    {% else %}
+    <div class="empty">No customer accounts yet.</div>
+    {% endif %}
+
 </div>
 
 {% endif %}
@@ -1103,7 +1422,6 @@ def logout():
 # 6. DASHBOARD
 # ==========================================
 
-
 @app.route("/dashboard")
 @login_required
 def home():
@@ -1148,17 +1466,14 @@ def home():
 
         return result["total"]
 
-    # TODAY
     today_income = total("income", today, today)
     today_expense = total("expense", today, today)
     today_profit = today_income - today_expense
 
-    # THIS WEEK
     week_income = total("income", week_start, today)
     week_expense = total("expense", week_start, today)
     week_profit = week_income - week_expense
 
-    # THIS MONTH
     month_income = total("income", month_start, today)
     month_expense = total("expense", month_start, today)
     month_profit = month_income - month_expense
@@ -1185,7 +1500,76 @@ def home():
 
 
 # ==========================================
-# 7. ADD TRANSACTION
+# 7. ANALYTICS
+# ==========================================
+
+@app.route("/analytics")
+@owner_required
+def analytics():
+    user = current_user()
+
+    today = date.today()
+    default_start = today.replace(day=1)
+
+    start_date = request.args.get("start", default_start.isoformat())
+    end_date = request.args.get("end", today.isoformat())
+
+    if not valid_date(start_date) or not valid_date(end_date):
+        abort(400)
+
+    if start_date > end_date:
+        abort(400)
+
+    conn = connect_db()
+
+    summary = conn.execute("""
+        SELECT
+            COALESCE(SUM(CASE WHEN type = 'income'
+                THEN amount_cents ELSE 0 END), 0) AS income,
+            COALESCE(SUM(CASE WHEN type = 'expense'
+                THEN amount_cents ELSE 0 END), 0) AS expense
+        FROM transactions
+        WHERE user_id = ?
+        AND txn_date BETWEEN ? AND ?
+    """, (user["id"], start_date, end_date)).fetchone()
+
+    rows = conn.execute("""
+        SELECT
+            txn_date,
+            SUM(CASE WHEN type = 'income'
+                THEN amount_cents ELSE 0 END) AS income,
+            SUM(CASE WHEN type = 'expense'
+                THEN amount_cents ELSE 0 END) AS expense
+        FROM transactions
+        WHERE user_id = ?
+        AND txn_date BETWEEN ? AND ?
+        GROUP BY txn_date
+        ORDER BY txn_date DESC
+    """, (user["id"], start_date, end_date)).fetchall()
+
+    conn.close()
+
+    daily_records = [
+        {
+            "date": row["txn_date"],
+            "income": row["income"],
+            "expense": row["expense"]
+        }
+        for row in rows
+    ]
+
+    return page(
+        "Analytics", "analytics", user,
+        start_date=start_date,
+        end_date=end_date,
+        total_income=summary["income"],
+        total_expense=summary["expense"],
+        daily_records=daily_records
+    )
+
+
+# ==========================================
+# 7B. ADD TRANSACTION
 # ==========================================
 
 @app.route("/transaction/add/<kind>", methods=["GET", "POST"])
@@ -1244,18 +1628,19 @@ def add_transaction(kind):
         db.execute("""
             INSERT INTO transactions
             (user_id, type, category, amount_cents,
-            description, txn_date, receipt, receipt_hash, created_at)
+             description, txn_date, receipt, receipt_hash, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-    user["id"],
-    transaction_type,
-    category,
-    amount,
-    description,
-    txn_date.isoformat(),
-    receipt,
-    receipt_hash,
-    datetime.now().isoformat(timespec="seconds")))
+            user["id"],
+            transaction_type,
+            category,
+            amount,
+            description,
+            txn_date.isoformat(),
+            receipt,
+            receipt_hash,
+            datetime.now().isoformat(timespec="seconds")
+        ))
 
         db.commit()
         db.close()
@@ -1327,23 +1712,23 @@ def history():
     if category:
         query += " AND category = ?"
         params.append(category)
+
     query += " ORDER BY txn_date DESC, id DESC"
 
     db = connect_db()
     records = db.execute(query, params).fetchall()
-    print("QUERY:", query)
-    print("PARAMS:", params)
-    print("RECORDS:", len(records))
     db.close()
 
-    return page("History", "history", user,
-    records=records,
-    start=start,
-    end=end,
-    kind=kind,
-    search=search,
-    category=category
-)
+    return page(
+        "History", "history", user,
+        records=records,
+        start=start,
+        end=end,
+        kind=kind,
+        search=search,
+        category=category
+    )
+
 
 @app.route("/photo-search", methods=["POST"])
 @owner_required
@@ -1399,20 +1784,14 @@ def photo_search():
 
     for distance, record in matches:
         record_data = dict(record)
-
-        similarity = (64 - distance) / 64 * 100
-
-        record_data["similarity"] = round(similarity, 1)
-
+        record_data["similarity"] = round((64 - distance) / 64 * 100, 1)
         matched_records.append(record_data)
 
-        if not matched_records:
-            flash("No similar receipt found.", "error")
+    if not matched_records:
+        flash("No similar receipt found.", "error")
 
     return page(
-        "History",
-        "history",
-        user,
+        "History", "history", user,
         records=matched_records,
         start="",
         end="",
@@ -1421,6 +1800,7 @@ def photo_search():
         category="",
         photo_search=True
     )
+
 
 # ==========================================
 # 9. EDIT TRANSACTION
@@ -1473,6 +1853,7 @@ def edit_transaction(transaction_id):
             ))
 
         receipt = record["receipt"]
+        receipt_hash = record["receipt_hash"]
 
         try:
             new_receipt = upload_receipt(request.files.get("receipt"))
@@ -1486,16 +1867,18 @@ def edit_transaction(transaction_id):
         if new_receipt:
             delete_receipt(receipt)
             receipt = new_receipt
+            receipt_hash = get_receipt_hash(UPLOAD_DIR / new_receipt)
 
         db.execute("""
             UPDATE transactions
             SET type=?, category=?, amount_cents=?,
-                description=?, txn_date=?, receipt=?
+                description=?, txn_date=?, receipt=?, receipt_hash=?
             WHERE id=? AND user_id=?
         """, (
             kind, category, amount,
             description, txn_date.isoformat(),
-            receipt, transaction_id, user["id"]
+            receipt, receipt_hash,
+            transaction_id, user["id"]
         ))
 
         db.commit()
@@ -1580,11 +1963,9 @@ def receipt(transaction_id):
     if not record or not record["receipt"]:
         abort(404)
 
-    filename = record["receipt"]
-
     return send_from_directory(
         UPLOAD_DIR,
-        filename,
+        record["receipt"],
         as_attachment=False
     )
 
@@ -1626,7 +2007,7 @@ def create_user():
     if (
         not business_name
         or len(business_name) > 80
-        or not re.fullmatch(r"[a-zA-Z0-9_.-]{3,40}", username)
+        or not USERNAME_RE.fullmatch(username)
         or len(password) < 8
         or len(password) > 128
     ):
@@ -1665,8 +2046,53 @@ def create_user():
     return redirect(url_for("admin"))
 
 
+def set_customer_active(user_id, active):
+    db = connect_db()
+
+    try:
+        customer = db.execute("""
+            SELECT id FROM users
+            WHERE id = ? AND role = 'owner'
+        """, (user_id,)).fetchone()
+
+        if not customer:
+            flash("Customer account not found.", "error")
+            return
+
+        db.execute("""
+            UPDATE users
+            SET active = ?
+            WHERE id = ? AND role = 'owner'
+        """, (1 if active else 0, user_id))
+
+        db.commit()
+
+        flash(
+            "Customer account reactivated successfully!"
+            if active else
+            "Customer account deactivated successfully!"
+        )
+
+    finally:
+        db.close()
+
+
+@app.route("/admin/deactivate-user/<int:user_id>", methods=["POST"])
+@admin_required
+def deactivate_user(user_id):
+    set_customer_active(user_id, False)
+    return redirect(url_for("admin"))
+
+
+@app.route("/admin/reactivate-user/<int:user_id>", methods=["POST"])
+@admin_required
+def reactivate_user(user_id):
+    set_customer_active(user_id, True)
+    return redirect(url_for("admin"))
+
+
 # ==========================================
-# 13. CREATE FIRST ADMIN
+# 13. CREATE FIRST ADMIN (command line)
 # ==========================================
 
 def create_admin():
@@ -1674,40 +2100,10 @@ def create_admin():
     print("\n=== DailyBiz Admin Setup ===")
 
     username = input("Admin username: ").strip()
-    password = input("Admin password (minimum 12 characters): ")
+    password = getpass.getpass("Admin password (12-128 characters): ")
 
-    if not re.fullmatch(r"[a-zA-Z0-9_.-]{3,40}", username):
-        print("Invalid username.")
-        return
-
-    if len(password) < 12 or len(password) > 128:
-        print("Password must be between 12 and 128 characters.")
-        return
-
-    db = connect_db()
-
-    try:
-        db.execute("""
-            INSERT INTO users
-            (username, password_hash, business_name,
-             role, active, created_at)
-            VALUES (?, ?, ?, 'admin', 1, ?)
-        """, (
-            username,
-            generate_password_hash(password),
-            "DailyBiz Administration",
-            datetime.now().strftime("%Y-%m-%d %H:%M")
-        ))
-
-        db.commit()
-
-        print("\nAdmin account created successfully!")
-
-    except sqlite3.IntegrityError:
-        print("\nThis username already exists.")
-
-    finally:
-        db.close()
+    ok, message = upsert_admin(username, password)
+    print("\n" + message)
 
 
 # ==========================================
@@ -1720,4 +2116,5 @@ if __name__ == "__main__":
         create_admin()
 
     else:
-        app.run(debug=True)
+        # Debug mode only when you ask for it: set FLASK_DEBUG=1
+        app.run(debug=os.environ.get("FLASK_DEBUG") == "1")
